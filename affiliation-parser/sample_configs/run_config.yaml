@@ -1,0 +1,9 @@
+description: "Example run configuration"
+tasks:
+  - description: "Process Crossref data file"
+    profile: "config/crossref_profile.json"
+    input_dir: "/Volumes/NewDisk/crossref_test"
+
+  - description: "Process Crossref data file"
+    profile: "config/datacite_profile.json"
+    input_dir: "/Volumes/NewDisk/datacite_test"
