@@ -1,0 +1,3 @@
+process_id,process_name,process_description
+proc_crossref_data_file_full_ingest,Crossref Data File Full Ingest,"Extracts authors, affiliations, RORs from full public data file JSONL.gz dumps"
+proc_openalex_works_affiliation_ingest,OpenAlex Works Affiliation Ingest,"Extracts authors, raw affiliation strings, and directly linked ROR IDs from OpenAlex Works JSONL dumps"

@@ -1,0 +1,91 @@
+{
+  "profile_description": "OpenAlex Works Data Author/Affiliation/ROR Extractor Profile",
+  "source_info": {
+    "source_id": "src_openalex",
+    "source_name": "OpenAlex",
+    "source_description": "OpenAlex Works data from JSONL dumps"
+  },
+  "process_info": {
+    "process_id": "proc_openalex_works_affiliation_ingest",
+    "process_name": "OpenAlex Works Affiliation Ingest",
+    "process_description": "Extracts authors, raw affiliation strings, and directly linked ROR IDs from OpenAlex Works JSONL dumps"
+  },
+  "record_identifier": {
+    "path": "/doi",
+    "required": true
+  },
+  "deterministic_ids": {
+    "record_prefix": "rec",
+    "value_prefix": "val",
+    "value_format": "{value_type}:{value_content}"
+  },
+  "null_values": {
+    "null_author": {
+      "value_type": "author_name",
+      "content": "<NULL_AUTHOR_NAME_CONTENT>"
+    },
+    "null_affiliation": {
+      "value_type": "affiliation",
+      "content": "<NULL_AFFILIATION_CONTENT>"
+    },
+    "null_ror_id": {
+      "value_type": "ror_id",
+      "content": "<NULL_ROR_ID_CONTENT>"
+    }
+  },
+  "filters": [
+    {
+      "cli_arg": "publication_year",
+      "path": "/publication_year"
+    },
+    {
+      "cli_arg": "type",
+      "path": "/type"
+    }
+  ],
+  "entities": [
+    {
+      "name": "Author",
+      "path": "/authorships",
+      "is_array": true,
+      "relationship_to_record": "has_author",
+      "value_extraction": {
+        "type": "field",
+        "field": "raw_author_name",
+        "target_value_type": "author_name",
+        "use_null": "null_author"
+      },
+      "nested_entities": [
+        {
+          "name": "AffiliationString",
+          "path": "/affiliations",
+          "is_array": true,
+          "relationship_to_parent": "has_affiliation",
+          "value_extraction": {
+            "type": "field",
+            "field": "raw_affiliation_string",
+            "target_value_type": "affiliation",
+            "use_null": "null_affiliation"
+          },
+          "lookup_joins": [
+            {
+              "name": "AffiliationToROR",
+              "lookup_array_path": "institutions",
+              "lookup_match_field": "id",
+              "source_match_field": "institution_ids",
+              "source_match_is_array": true,
+              "extract_value": {
+                "type": "field",
+                "field": "ror",
+                "target_value_type": "ror_id",
+                "use_null": "null_ror_id"
+              },
+              "relationship_to_current": "identified_by",
+              "take_first_match": true
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

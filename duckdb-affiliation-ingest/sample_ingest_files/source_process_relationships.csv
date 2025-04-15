@@ -1,0 +1,3 @@
+source_process_id,source_id,process_id,relationship_type,start_date,end_date
+e82953d2-fe2e-488a-bca3-67870b2855c2,src_crossref,proc_crossref_data_file_full_ingest,defined_by,2025-04-14,
+2d23a956-b47f-45d9-b1ec-5b0e541d3b14,src_openalex,proc_openalex_works_affiliation_ingest,defined_by,2025-04-14,

@@ -1,9 +1,9 @@
 description: "Example run configuration"
 tasks:
   - description: "Process Crossref data file"
-    profile: "config/crossref_profile.json"
-    input_dir: "/Volumes/NewDisk/crossref_test"
+    profile: "sample_configs/crossref_profile.json"
+    input_dir: "sample_inputs/crossref"
 
-  - description: "Process Crossref data file"
-    profile: "config/datacite_profile.json"
-    input_dir: "/Volumes/NewDisk/datacite_test"
+  - description: "Process OpenAlex data file"
+    profile: "sample_configs/openalex_profile.json"
+    input_dir: "sample_inputs/openalex"

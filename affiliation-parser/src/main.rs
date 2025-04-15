@@ -74,7 +74,6 @@ mod memory_usage {
     pub fn log_memory_usage(note: &str) { if let Some(stats) = get_memory_usage() { let percent_str = stats.percent.map_or_else(|| "N/A".to_string(), |p| format!("{:.1}%", p)); info!("Memory usage ({}): {:.1} MB physical (RSS), {:.1} MB virtual/commit, {} of system memory", note, stats.rss_mb, stats.vm_size_mb, percent_str); } else { info!("Memory usage tracking not available or failed on this platform ({})", std::env::consts::OS); } }
 }
 
-
 #[derive(Deserialize, Debug, Clone)]
 struct RunConfig {
     description: Option<String>,
@@ -116,7 +115,6 @@ struct ProcessInfo {
     process_description: Option<String>,
 }
 
-
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 struct RecordIdentifierConfig {
     path: String,
@@ -150,9 +148,13 @@ struct EntityConfig {
     is_array: bool,
     relationship_to_record: Option<String>,
     relationship_to_parent: Option<String>,
+    #[serde(default)]
+    relationship_confidence: Option<f32>,
     value_extraction: Option<ValueExtractionConfig>,
     nested_entities: Option<Vec<EntityConfig>>,
     related_values: Option<Vec<RelatedValueConfig>>,
+    #[serde(default)]
+    lookup_joins: Option<Vec<LookupJoinConfig>>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -163,6 +165,8 @@ struct RelatedValueConfig {
     filter_condition: Option<FilterConditionConfig>,
     extract_value: ValueExtractionConfig,
     relationship_to_parent: String,
+    #[serde(default)]
+    relationship_confidence: Option<f32>,
     take_first_match: Option<bool>,
 }
 
@@ -170,9 +174,22 @@ struct RelatedValueConfig {
 #[serde(tag = "type")]
 enum ValueExtractionConfig {
     #[serde(rename = "field")]
-    Field { field: String, target_value_type: String, use_null: Option<String> },
+    Field {
+        field: String,
+        target_value_type: String,
+        use_null: Option<String>,
+        #[serde(default)]
+        confidence_score: Option<f32>,
+    },
     #[serde(rename = "combine_fields")]
-    CombineFields { fields: Vec<String>, separator: String, target_value_type: String, use_null: Option<String> },
+    CombineFields {
+        fields: Vec<String>,
+        separator: String,
+        target_value_type: String,
+        use_null: Option<String>,
+        #[serde(default)]
+        confidence_score: Option<f32>,
+    },
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -182,6 +199,25 @@ struct FilterConditionConfig {
     case_insensitive: Option<bool>,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+struct LookupJoinConfig {
+    name: String,
+    lookup_array_path: String,
+    lookup_match_field: String,
+    source_match_field: String,
+    #[serde(default = "default_source_match_is_array")]
+    source_match_is_array: bool,
+    extract_value: ValueExtractionConfig,
+    relationship_to_current: String,
+    #[serde(default)]
+    relationship_confidence: Option<f32>,
+    #[serde(default)]
+    take_first_match: bool,
+}
+
+fn default_source_match_is_array() -> bool {
+    false
+}
 
 impl ValueExtractionConfig {
      fn get_null_ref(&self) -> Option<&String> {
@@ -190,8 +226,14 @@ impl ValueExtractionConfig {
              ValueExtractionConfig::CombineFields { use_null, .. } => use_null.as_ref(),
          }
      }
-}
 
+     fn get_confidence_score(&self) -> Option<f32> {
+         match self {
+             ValueExtractionConfig::Field { confidence_score, .. } => *confidence_score,
+             ValueExtractionConfig::CombineFields { confidence_score, .. } => *confidence_score,
+         }
+     }
+}
 
 fn generate_deterministic_id(prefix: &str, content: &str) -> String {
     let mut hasher = Sha256::new();
@@ -199,7 +241,6 @@ fn generate_deterministic_id(prefix: &str, content: &str) -> String {
     let result = hasher.finalize();
     format!("{}-sha256-{}", prefix, hex::encode(result))
 }
-
 
 #[derive(Parser, Clone)]
 #[command(name = "Affiliation Extractor - Multi Profile Runner")]
@@ -223,9 +264,9 @@ struct Cli {
 #[derive(Debug, Clone)] struct RecordRow { record_id: String, doi: String }
 #[derive(Debug, Clone)] struct ValueRow { value_id: String, value_type: String, value_content: String }
 #[derive(Debug, Clone)] struct ProcessRecordRow { process_record_id: String, process_id: String, record_id: String, relationship_type: String, timestamp: String }
-#[derive(Debug, Clone)] struct ProcessValueRow { process_value_id: String, process_id: String, value_id: String, relationship_type: String, confidence_score: f32, timestamp: String }
+#[derive(Debug, Clone)] struct ProcessValueRow { process_value_id: String, process_id: String, value_id: String, relationship_type: String, confidence_score: Option<f32>, timestamp: String }
 #[derive(Debug, Clone)] struct RecordValueRow { record_value_id: String, record_id: String, value_id: String, relationship_type: String, ordinal: i32, process_id: String, timestamp: String }
-#[derive(Debug, Clone)] struct ValueValueRow { value_value_id: String, source_value_id: String, target_value_id: String, relationship_type: String, ordinal: Option<i32>, process_id: String, confidence_score: f32, timestamp: String }
+#[derive(Debug, Clone)] struct ValueValueRow { value_value_id: String, source_value_id: String, target_value_id: String, relationship_type: String, ordinal: Option<i32>, process_id: String, confidence_score: Option<f32>, timestamp: String }
 
 #[derive(Debug, Default)]
 struct OutputBatch {
@@ -344,7 +385,7 @@ impl JsonlProcessor {
                         &self.profile.entities,
                         &mut batch,
                     ) {
-                         warn!("Error processing entities for record {} in {}: {}", record_id, filepath.display(), e);
+                        warn!("Error processing entities for record {} in {}: {}", record_id, filepath.display(), e);
                     }
 
                 },
@@ -355,78 +396,232 @@ impl JsonlProcessor {
             }
         }
         debug!("Finished {}: Lines={}, Records={}, Skipped(NoID)={}, Filtered={}, JsonErrors={}",
-            filepath.display(), lines_processed, records_processed, records_missing_id, records_filtered_out, json_parsing_errors);
+               filepath.display(), lines_processed, records_processed, records_missing_id, records_filtered_out, json_parsing_errors);
 
         Ok(batch)
     }
 
     fn process_json_node(
         &self,
-        current_node: &Value,
+        context_node: &Value,
         record_id: &str,
         parent_value_id: Option<&str>,
         entity_configs: &[EntityConfig],
         batch: &mut OutputBatch,
     ) -> Result<()> {
         for config in entity_configs {
-            if let Some(entity_data) = self.get_value_at_path(current_node, &config.path) {
-                let items_to_process = if config.is_array {
-                    entity_data.as_array().map(|a| a.iter().cloned().collect()).unwrap_or_default()
+            if let Some(entity_data_node) = self.get_value_at_path(context_node, &config.path) {
+
+                let items_to_process: Vec<Value> = if config.is_array {
+                    entity_data_node.as_array().map(|a| a.iter().cloned().collect()).unwrap_or_default()
+                } else if !entity_data_node.is_null() {
+                     vec![entity_data_node.clone()]
                 } else {
-                    vec![entity_data.clone()]
+                     Vec::new()
                 };
+
 
                 for (ordinal, item_node) in items_to_process.into_iter().enumerate() {
                     let current_ordinal = (ordinal + 1) as i32;
                     let mut current_entity_value_id: Option<String> = None;
 
                     if let Some(val_config) = &config.value_extraction {
-                         let (extracted_content, value_type) = self.extract_value(&item_node, val_config)?;
-                         match self.get_or_create_value_id(&extracted_content, &value_type, val_config.get_null_ref()) {
-                             Ok((final_content, value_id)) => {
-                                 self.add_value_rows(&value_id, &value_type, &final_content, batch)?;
-                                 current_entity_value_id = Some(value_id.clone());
+                        match self.extract_value(&item_node, val_config) {
+                             Ok((extracted_content, value_type)) => {
+                                 match self.get_or_create_value_id(&extracted_content, &value_type, val_config.get_null_ref()) {
+                                     Ok((final_content, value_id)) => {
+                                         let creation_confidence = val_config.get_confidence_score();
+                                         self.add_value_rows(&value_id, &value_type, &final_content, creation_confidence, batch)?;
+                                         current_entity_value_id = Some(value_id.clone());
 
-                                 if let Some(parent_id) = parent_value_id {
-                                     if let Some(rel_type) = &config.relationship_to_parent {
-                                         self.add_value_value_relationship(parent_id, &value_id, rel_type, Some(current_ordinal), batch)?;
-                                     }
-                                 } else {
-                                     if let Some(rel_type) = &config.relationship_to_record {
-                                          self.add_record_value_relationship(record_id, &value_id, rel_type, current_ordinal, batch)?;
+                                         if let Some(parent_id) = parent_value_id {
+                                             if let Some(rel_type) = &config.relationship_to_parent {
+                                                 let relationship_confidence = config.relationship_confidence;
+                                                 self.add_value_value_relationship(parent_id, &value_id, rel_type, Some(current_ordinal), relationship_confidence, batch)?;
+                                             }
+                                         } else {
+                                             if let Some(rel_type) = &config.relationship_to_record {
+                                                  self.add_record_value_relationship(record_id, &value_id, rel_type, current_ordinal, batch)?;
+                                             }
+                                         }
+                                     },
+                                     Err(e) => {
+                                         warn!("L1: Failed to get/create value ID for entity '{}' in record {}: {}", config.name, record_id, e);
                                      }
                                  }
-                             },
+                             }
                              Err(e) => {
-                                 warn!("Failed to get/create value ID for entity '{}' in record {}: {}", config.name, record_id, e);
-                                 continue;
+                                 warn!("Failed to extract primary value for entity '{}' in record {}: {}", config.name, record_id, e);
                              }
                          }
                     }
 
-                    let parent_id_for_children = current_entity_value_id.as_deref().or(parent_value_id);
+                    let id_for_children = current_entity_value_id.as_deref().or(parent_value_id);
 
-                    if let Some(pid) = parent_id_for_children {
-                        if let Some(nested_configs) = &config.nested_entities {
-                            if let Err(e) = self.process_json_node(&item_node, record_id, Some(pid), nested_configs, batch) {
-                                 warn!("Error processing nested entities for {} under parent {}: {}", config.name, pid, e);
-                            }
-                        }
-                        if let Some(related_configs) = &config.related_values {
-                            if let Err(e) = self.process_related_values(&item_node, pid, related_configs, batch) {
-                                 warn!("Error processing related values for {} under parent {}: {}", config.name, pid, e);
-                            }
-                        }
+                    if let Some(child_or_related_id) = id_for_children {
+                         if let Some(nested_configs) = &config.nested_entities {
+                              if let Err(e) = self.process_json_node(&item_node, record_id, Some(child_or_related_id), nested_configs, batch) {
+                                  warn!("Error processing nested entities for {} under parent {}: {}", config.name, child_or_related_id, e);
+                              }
+                         }
+
+                         if let Some(related_configs) = &config.related_values {
+                              if let Err(e) = self.process_related_values(&item_node, child_or_related_id, related_configs, batch) {
+                                  warn!("Error processing related values for {} under parent {}: {}", config.name, child_or_related_id, e);
+                              }
+                         }
                     } else if config.nested_entities.is_some() || config.related_values.is_some() {
                          warn!("Cannot process nested/related entities for '{}' in record {} because no parent value ID was established or inherited.", config.name, record_id);
                     }
+
+
+                    if let Some(join_configs) = &config.lookup_joins {
+                         if let Some(source_value_id) = &current_entity_value_id {
+                             if let Err(e) = self.process_lookup_joins(
+                                 context_node,
+                                 &item_node,
+                                 source_value_id,
+                                 join_configs,
+                                 record_id,
+                                 batch,
+                             ) {
+                                 warn!("Error processing lookup joins for entity '{}' (value ID {}) in record {}: {}", config.name, source_value_id, record_id, e);
+                             }
+                         } else if !join_configs.is_empty() {
+                              debug!("Skipping lookup joins for entity '{}' in record {} because the entity itself did not produce a value/ID.", config.name, record_id);
+                         }
+                    }
+
+                }
+            } else {
+                debug!("Path '{}' not found or is null in context for entity '{}'. Skipping.", config.path, config.name);
+            }
+        }
+        Ok(())
+    }
+
+    fn process_lookup_joins(
+        &self,
+        context_node: &Value,
+        current_item_node: &Value,
+        source_value_id: &str,
+        join_configs: &[LookupJoinConfig],
+        record_id: &str,
+        batch: &mut OutputBatch,
+    ) -> Result<()> {
+        for join_config in join_configs {
+            let source_ids_to_match: HashSet<String> = match self.get_value_at_path(current_item_node, &join_config.source_match_field) {
+                Some(source_id_node) => {
+                    if join_config.source_match_is_array {
+                        source_id_node.as_array()
+                            .map(|arr| arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect::<HashSet<String>>())
+                            .unwrap_or_default()
+                    } else {
+                        source_id_node.as_str()
+                            .map(|s| vec![s.to_string()].into_iter().collect())
+                            .unwrap_or_default()
+                    }
+                }
+                None => HashSet::new(),
+            };
+
+            if source_ids_to_match.is_empty() {
+                debug!("Lookup Join '{}': Source match field '{}' yielded no IDs in record {}. Skipping join.", join_config.name, join_config.source_match_field, record_id);
+                continue;
+            }
+
+            match self.get_value_at_path(context_node, &join_config.lookup_array_path) {
+                Some(lookup_array_node) => {
+                    if let Some(lookup_array) = lookup_array_node.as_array() {
+                        let mut match_found_for_config = false;
+
+                        for lookup_item in lookup_array {
+                            if let Some(lookup_id) = self.get_value_at_path(lookup_item, &join_config.lookup_match_field).and_then(|v| v.as_str()) {
+                                if source_ids_to_match.contains(lookup_id) {
+                                    match_found_for_config = true;
+
+                                    match self.extract_value(lookup_item, &join_config.extract_value) {
+                                         Ok((extracted_content, value_type)) => {
+                                             match self.get_or_create_value_id(&extracted_content, &value_type, join_config.extract_value.get_null_ref()) {
+                                                 Ok((final_content, target_value_id)) => {
+                                                     let creation_confidence = join_config.extract_value.get_confidence_score();
+                                                     self.add_value_rows(&target_value_id, &value_type, &final_content, creation_confidence, batch)?;
+
+                                                     let relationship_confidence = join_config.relationship_confidence;
+                                                     self.add_value_value_relationship(
+                                                         source_value_id,
+                                                         &target_value_id,
+                                                         &join_config.relationship_to_current,
+                                                         None,
+                                                         relationship_confidence,
+                                                         batch
+                                                     )?;
+                                                 },
+                                                 Err(e) => {
+                                                     warn!("L2: Failed to get/create value ID for Lookup Join '{}' in record {}: {}", join_config.name, record_id, e);
+                                                 }
+                                             }
+                                         },
+                                         Err(e) => {
+                                             warn!("Failed to extract target value for Lookup Join '{}' in record {}: {}", join_config.name, record_id, e);
+                                         }
+                                     }
+
+                                    if join_config.take_first_match {
+                                         break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !match_found_for_config {
+                            if let Some(null_key) = join_config.extract_value.get_null_ref() {
+                                debug!("Lookup Join '{}': No matching item found in lookup path '{}' for source IDs derived from '{}' in record {}. Applying null default '{}'.",
+                                    join_config.name, join_config.lookup_array_path, join_config.source_match_field, record_id, null_key);
+                                if let Some(null_config) = self.profile.null_values.get(null_key) {
+                                    if let Some(null_id) = self.null_value_ids.get(null_key) {
+                                         self.add_value_rows(null_id, &null_config.value_type, &null_config.content, None, batch)?;
+                                         self.add_value_value_relationship(source_value_id, null_id, &join_config.relationship_to_current, None, None, batch)?;
+                                    } else { warn!("(Lookup Join - No Match) Precomputed null ID not found for key: {}", null_key); }
+                                } else { warn!("(Lookup Join - No Match) Null value config not found for key: {}", null_key); }
+                            }
+                        }
+
+                    } else {
+                        warn!("Lookup Join '{}': Path '{}' did not resolve to an array in record {}.", join_config.name, join_config.lookup_array_path, record_id);
+                        if let Some(null_key) = join_config.extract_value.get_null_ref() {
+                            debug!("Lookup Join '{}': Lookup path '{}' did not resolve to an array in record {}. Applying null default '{}'.",
+                                join_config.name, join_config.lookup_array_path, record_id, null_key);
+                            if let Some(null_config) = self.profile.null_values.get(null_key) {
+                                if let Some(null_id) = self.null_value_ids.get(null_key) {
+                                    self.add_value_rows(null_id, &null_config.value_type, &null_config.content, None, batch)?;
+                                    self.add_value_value_relationship(source_value_id, null_id, &join_config.relationship_to_current, None, None, batch)?;
+                                } else { warn!("(Lookup Join - Bad Path) Precomputed null ID not found for key: {}", null_key); }
+                            } else { warn!("(Lookup Join - Bad Path) Null value config not found for key: {}", null_key); }
+                        }
+                    }
+                }
+                None => {
+                    debug!("Lookup Join '{}': Lookup path '{}' not found in context node for record {}.", join_config.name, join_config.lookup_array_path, record_id);
+                     if let Some(null_key) = join_config.extract_value.get_null_ref() {
+                        debug!("Lookup Join '{}': Lookup path '{}' not found in record {}. Applying null default '{}'.",
+                            join_config.name, join_config.lookup_array_path, record_id, null_key);
+                        if let Some(null_config) = self.profile.null_values.get(null_key) {
+                            if let Some(null_id) = self.null_value_ids.get(null_key) {
+                                 self.add_value_rows(null_id, &null_config.value_type, &null_config.content, None, batch)?;
+                                 self.add_value_value_relationship(source_value_id, null_id, &join_config.relationship_to_current, None, None, batch)?;
+                            } else { warn!("(Lookup Join - Missing Path) Precomputed null ID not found for key: {}", null_key); }
+                        } else { warn!("(Lookup Join - Missing Path) Null value config not found for key: {}", null_key); }
+                     }
                 }
             }
         }
         Ok(())
     }
 
-   fn process_related_values(
+    fn process_related_values(
         &self,
         current_node: &Value,
         parent_value_id: &str,
@@ -460,16 +655,19 @@ impl JsonlProcessor {
                             Ok((extracted_content, value_type)) => {
                                 match self.get_or_create_value_id(&extracted_content, &value_type, config.extract_value.get_null_ref()) {
                                     Ok((final_content, value_id)) => {
-                                        self.add_value_rows(&value_id, &value_type, &final_content, batch)?;
-                                        self.add_value_value_relationship(parent_value_id, &value_id, &config.relationship_to_parent, None, batch)?;
+                                        let creation_confidence = config.extract_value.get_confidence_score();
+                                        self.add_value_rows(&value_id, &value_type, &final_content, creation_confidence, batch)?;
+
+                                        let relationship_confidence = config.relationship_confidence;
+                                        self.add_value_value_relationship(parent_value_id, &value_id, &config.relationship_to_parent, None, relationship_confidence, batch)?;
                                         found_match_for_config = true;
 
                                         if config.take_first_match.unwrap_or(false) {
-                                            break;
+                                             break;
                                         }
                                     },
                                     Err(e) => {
-                                         warn!("Failed to get/create value ID for related value '{}' (path '{}', field '{}') under parent {}: {}", config.name, config.path, "", parent_value_id, e);
+                                        warn!("Failed to get/create value ID for related value '{}' (path '{}', field '{}') under parent {}: {}", config.name, config.path, "", parent_value_id, e);
                                     }
                                 }
                             },
@@ -479,37 +677,37 @@ impl JsonlProcessor {
                         }
                     }
                 }
-                 if !found_match_for_config && config.filter_condition.is_some() {
+
+                if !found_match_for_config && config.filter_condition.is_some() {
                     if let Some(null_key) = config.extract_value.get_null_ref() {
                         debug!("Path '{}' existed for parent {}, but no item met filter condition for related value '{}'. Applying null default '{}'.", config.path, parent_value_id, config.name, null_key);
                         if let Some(null_config) = self.profile.null_values.get(null_key) {
-                             if let Some(null_id) = self.null_value_ids.get(null_key) {
-                                 self.add_value_rows(null_id, &null_config.value_type, &null_config.content, batch)?;
-                                 self.add_value_value_relationship(parent_value_id, null_id, &config.relationship_to_parent, None, batch)?;
-                             } else { warn!("(Post-filter) Precomputed null ID not found for key: {}", null_key); }
+                            if let Some(null_id) = self.null_value_ids.get(null_key) {
+                                 self.add_value_rows(null_id, &null_config.value_type, &null_config.content, None, batch)?;
+                                 self.add_value_value_relationship(parent_value_id, null_id, &config.relationship_to_parent, None, None, batch)?;
+                            } else { warn!("(Post-filter) Precomputed null ID not found for key: {}", null_key); }
                         } else { warn!("(Post-filter) Null value config not found for key: {}", null_key); }
                     }
-                 }
+                }
 
             } else {
-                if let Some(null_key) = config.extract_value.get_null_ref() {
+                 if let Some(null_key) = config.extract_value.get_null_ref() {
                      debug!("Path '{}' missing for parent {}, applying null default '{}' for related value '{}'.", config.path, parent_value_id, null_key, config.name);
                      if let Some(null_config) = self.profile.null_values.get(null_key) {
                          if let Some(null_id) = self.null_value_ids.get(null_key) {
-                             self.add_value_rows(null_id, &null_config.value_type, &null_config.content, batch)?;
-                             self.add_value_value_relationship(parent_value_id, null_id, &config.relationship_to_parent, None, batch)?;
+                               self.add_value_rows(null_id, &null_config.value_type, &null_config.content, None, batch)?;
+                               self.add_value_value_relationship(parent_value_id, null_id, &config.relationship_to_parent, None, None, batch)?;
                          } else {
-                              warn!("Could not find precomputed null ID for key '{}' when handling missing path '{}' for parent {}", null_key, config.path, parent_value_id);
+                             warn!("Could not find precomputed null ID for key '{}' when handling missing path '{}' for parent {}", null_key, config.path, parent_value_id);
                          }
-                    } else {
+                     } else {
                          warn!("Could not find null value config for key '{}' when handling missing path '{}' for parent {}", null_key, config.path, parent_value_id);
-                    }
-                }
+                     }
+                 }
             }
         }
         Ok(())
     }
-
 
     fn should_filter_out(&self, record: &Value) -> Result<bool> {
         if self.active_filters.is_empty() { return Ok(false); }
@@ -522,9 +720,9 @@ impl JsonlProcessor {
                 if current_value.is_none() {
                     if let Some(fallback_path) = &profile_filter_config.fallback_from {
                         if let Some(primary_id) = self.get_value_at_path(record, fallback_path).and_then(|v| v.as_str()) {
-                             if (fallback_path == "/DOI" || fallback_path == "DOI") && key == "doi_prefix" {
-                                 current_value = primary_id.split_once('/').map(|(pfx, _)| pfx.to_string());
-                             }
+                                if (fallback_path == "/DOI" || fallback_path == "DOI") && key == "doi_prefix" {
+                                    current_value = primary_id.split_once('/').map(|(pfx, _)| pfx.to_string());
+                                }
                         }
                     }
                 }
@@ -533,7 +731,7 @@ impl JsonlProcessor {
                     return Ok(true);
                 }
             } else {
-                 warn!("Active filter key '{}' not found in profile filter definitions.", key);
+                warn!("Active filter key '{}' not found in profile filter definitions.", key);
             }
         }
         Ok(false)
@@ -567,7 +765,7 @@ impl JsonlProcessor {
         }
     }
 
-     fn get_or_create_value_id(
+    fn get_or_create_value_id(
         &self,
         extracted_content: &Option<String>,
         value_type: &str,
@@ -603,7 +801,14 @@ impl JsonlProcessor {
         generate_deterministic_id(&self.profile.deterministic_ids.value_prefix, &id_hashing_content)
     }
 
-     fn add_value_rows(&self, value_id: &str, value_type: &str, value_content: &str, batch: &mut OutputBatch) -> Result<()> {
+    fn add_value_rows(
+        &self,
+        value_id: &str,
+        value_type: &str,
+        value_content: &str,
+        confidence: Option<f32>,
+        batch: &mut OutputBatch,
+    ) -> Result<()> {
         batch.values.push(ValueRow {
             value_id: value_id.to_string(),
             value_type: value_type.to_string(),
@@ -614,26 +819,37 @@ impl JsonlProcessor {
             process_id: self.profile.process_info.process_id.clone(),
             value_id: value_id.to_string(),
             relationship_type: "created".to_string(),
-            confidence_score: 1.0,
+            confidence_score: confidence,
             timestamp: self.timestamp_str.to_string(),
         });
         Ok(())
-     }
-
-    fn add_value_value_relationship(&self, source_id: &str, target_id: &str, rel_type: &str, ordinal: Option<i32>, batch: &mut OutputBatch) -> Result<()> {
-         batch.value_value_relationships.push(ValueValueRow {
-             value_value_id: generate_relationship_uuid(),
-             source_value_id: source_id.to_string(),
-             target_value_id: target_id.to_string(),
-             relationship_type: rel_type.to_string(),
-             ordinal,
-             process_id: self.profile.process_info.process_id.clone(),
-             confidence_score: 1.0,
-             timestamp: self.timestamp_str.to_string(),
-         });
-         Ok(())
     }
-    fn add_record_value_relationship(&self, record_id: &str, value_id: &str, rel_type: &str, ordinal: i32, batch: &mut OutputBatch) -> Result<()> {
+
+    fn add_value_value_relationship(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        rel_type: &str,
+        ordinal: Option<i32>,
+        confidence: Option<f32>,
+        batch: &mut OutputBatch,
+    ) -> Result<()> {
+        batch.value_value_relationships.push(ValueValueRow {
+            value_value_id: generate_relationship_uuid(),
+            source_value_id: source_id.to_string(),
+            target_value_id: target_id.to_string(),
+            relationship_type: rel_type.to_string(),
+            ordinal,
+            process_id: self.profile.process_info.process_id.clone(),
+            confidence_score: confidence,
+            timestamp: self.timestamp_str.to_string(),
+        });
+        Ok(())
+    }
+
+    fn add_record_value_relationship(
+        &self, record_id: &str, value_id: &str, rel_type: &str, ordinal: i32, batch: &mut OutputBatch
+    ) -> Result<()> {
         batch.record_value_relationships.push(RecordValueRow {
             record_value_id: generate_relationship_uuid(),
             record_id: record_id.to_string(),
@@ -676,7 +892,6 @@ const DATA_TABLE_NAMES: [&str; 6] = [
     "records", "values", "process_record_relationships", "process_value_relationships", "record_value_relationships", "value_value_relationships",
 ];
 const METADATA_TABLE_NAMES: [&str; 3] = ["sources", "processes", "source_process_relationships"];
-
 
 type ProcessValueRelKey = (String, String, String);
 type ValueValueRelKey = (String, String, String, Option<i32>);
@@ -738,25 +953,25 @@ impl MultiTableCsvOutput {
             let mut seen_source_ids = HashSet::new();
             let mut seen_process_ids = HashSet::new();
 
-             let metadata_headers: HashMap<&str, Vec<&str>> = [
-                 ("sources", vec!["source_id", "source_name", "source_description"]),
-                 ("processes", vec!["process_id", "process_name", "process_description"]),
-                 ("source_process_relationships", vec!["source_process_id", "source_id", "process_id", "relationship_type", "start_date", "end_date"]),
-             ].iter().cloned().collect();
+            let metadata_headers: HashMap<&str, Vec<&str>> = [
+                  ("sources", vec!["source_id", "source_name", "source_description"]),
+                  ("processes", vec!["process_id", "process_name", "process_description"]),
+                  ("source_process_relationships", vec!["source_process_id", "source_id", "process_id", "relationship_type", "start_date", "end_date"]),
+            ].iter().cloned().collect();
 
-             let mut metadata_writers = HashMap::new();
-             for &table_name in METADATA_TABLE_NAMES.iter() {
-                 let file_path = output_dir.join(format!("{}.csv", table_name));
-                 let file = File::create(&file_path)?;
-                 files_created += 1;
-                 let mut writer = Writer::from_writer(file);
-                  if let Some(header_vec) = metadata_headers.get(table_name) { writer.write_record(header_vec)?; } else { warn!("No headers defined for metadata table: {}", table_name); }
+            let mut metadata_writers = HashMap::new();
+            for &table_name in METADATA_TABLE_NAMES.iter() {
+                let file_path = output_dir.join(format!("{}.csv", table_name));
+                let file = File::create(&file_path)?;
+                files_created += 1;
+                let mut writer = Writer::from_writer(file);
+                 if let Some(header_vec) = metadata_headers.get(table_name) { writer.write_record(header_vec)?; } else { warn!("No headers defined for metadata table: {}", table_name); }
                  metadata_writers.insert(table_name.to_string(), writer);
                  rows_written.insert(table_name.to_string(), AtomicUsize::new(0));
-             }
+            }
 
-             let current_date = Utc::now().format("%Y-%m-%d").to_string();
-             for profile in &all_profiles_in_run {
+            let current_date = Utc::now().format("%Y-%m-%d").to_string();
+            for profile in &all_profiles_in_run {
                  let source_id = &profile.source_info.source_id;
                  let process_id = &profile.process_info.process_id;
 
@@ -782,25 +997,25 @@ impl MultiTableCsvOutput {
                  }
 
                  if let Some(writer) = metadata_writers.get_mut("source_process_relationships") {
-                      let sp_id = generate_relationship_uuid();
-                      let _count = rows_written.entry("source_process_relationships".to_string()).or_insert(AtomicUsize::new(0)).value().fetch_add(1, Ordering::Relaxed);
-                      writer.write_record(&[
-                          &sp_id,
-                          source_id,
-                          process_id,
-                          "defined_by",
-                          &current_date,
-                          "",
-                      ])?;
+                     let sp_id = generate_relationship_uuid();
+                     let _count = rows_written.entry("source_process_relationships".to_string()).or_insert(AtomicUsize::new(0)).value().fetch_add(1, Ordering::Relaxed);
+                     writer.write_record(&[
+                        &sp_id,
+                        source_id,
+                        process_id,
+                        "defined_by",
+                        &current_date,
+                        "",
+                     ])?;
                  }
-             }
+            }
 
-             for (_name, writer) in metadata_writers.iter_mut() {
+            for (_name, writer) in metadata_writers.iter_mut() {
                  writer.flush()?;
-             }
-             info!("Metadata files created and populated.");
+            }
+            info!("Metadata files created and populated.");
         } else {
-            info!("Skipping creation of metadata files.");
+             info!("Skipping creation of metadata files.");
         }
 
         Ok(Self {
@@ -828,7 +1043,7 @@ impl MultiTableCsvOutput {
         } else {
              if self.create_metadata_files && METADATA_TABLE_NAMES.contains(&table_name) {
              } else {
-                 warn!("Attempted to increment row count for unknown or non-initialized table: {}", table_name);
+                  warn!("Attempted to increment row count for unknown or non-initialized table: {}", table_name);
              }
         }
     }
@@ -870,9 +1085,9 @@ impl OutputWriter for MultiTableCsvOutput {
                     writer.write_record(&[
                         row.process_value_id,
                         row.process_id,
-                        row.value_id, // Corrected from original code which had record_id
+                        row.value_id,
                         row.relationship_type,
-                        row.confidence_score.to_string(),
+                        row.confidence_score.map_or("".to_string(), |c| c.to_string()),
                         row.timestamp
                     ])?;
                 }
@@ -891,13 +1106,13 @@ impl OutputWriter for MultiTableCsvOutput {
             let mut new_rels_to_write = Vec::new();
             for row in batch.value_value_relationships {
                  let key: ValueValueRelKey = (
-                    row.source_value_id.clone(),
-                    row.target_value_id.clone(),
-                    row.relationship_type.clone(),
-                    row.ordinal
+                      row.source_value_id.clone(),
+                      row.target_value_id.clone(),
+                      row.relationship_type.clone(),
+                      row.ordinal
                  );
                  if self.written_value_value_rels.insert(key) {
-                    new_rels_to_write.push(row);
+                      new_rels_to_write.push(row);
                  }
             }
 
@@ -912,7 +1127,7 @@ impl OutputWriter for MultiTableCsvOutput {
                         row.relationship_type,
                         row.ordinal.map_or("".to_string(), |o| o.to_string()),
                         row.process_id,
-                        row.confidence_score.to_string(),
+                        row.confidence_score.map_or("".to_string(), |c| c.to_string()),
                         row.timestamp
                     ])?;
                 }
@@ -972,16 +1187,16 @@ impl OutputWriter for MultiTableCsvOutput {
 
         for (null_key, value_id) in self.null_value_ids.iter() {
              if self.written_value_ids.insert(value_id.clone()) {
-                 let null_config = self.all_profiles_in_run.iter()
-                     .find_map(|p| p.null_values.get(null_key));
+                  let null_config = self.all_profiles_in_run.iter()
+                      .find_map(|p| p.null_values.get(null_key));
 
-                 if let Some(config) = null_config {
-                     writer.write_record(&[value_id, &config.value_type, &config.content])?;
-                     self.increment_row_count("values", 1);
-                     nulls_added += 1;
-                 } else {
+                  if let Some(config) = null_config {
+                      writer.write_record(&[value_id, &config.value_type, &config.content])?;
+                      self.increment_row_count("values", 1);
+                      nulls_added += 1;
+                  } else {
                       warn!("Could not find configuration details for precomputed null key '{}' during finalization.", null_key);
-                 }
+                  }
              }
         }
 
@@ -990,7 +1205,6 @@ impl OutputWriter for MultiTableCsvOutput {
         Ok(())
     }
 }
-
 
 struct CsvWriterManager {
     writer_impl: Box<dyn OutputWriter>,
@@ -1104,7 +1318,6 @@ fn resolve_task_filters(
     resolved
 }
 
-
 fn main() -> Result<()> {
     let start_time = Instant::now();
     let cli = Cli::parse();
@@ -1158,9 +1371,9 @@ fn main() -> Result<()> {
             std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let profile_content = fs::read_to_string(&task.profile)
-                   .with_context(|| format!("Task {}: Failed to read profile file: {}", i+1, task.profile.display()))?;
+                         .with_context(|| format!("Task {}: Failed to read profile file: {}", i+1, task.profile.display()))?;
                 let parsed_profile: Profile = serde_json::from_str(&profile_content)
-                       .with_context(|| format!("Task {}: Failed to parse profile JSON from {}", i+1, task.profile.display()))?;
+                             .with_context(|| format!("Task {}: Failed to parse profile JSON from {}", i+1, task.profile.display()))?;
                 let arc_profile = Arc::new(parsed_profile);
                 entry.insert(Arc::clone(&arc_profile));
                 arc_profile
@@ -1168,7 +1381,7 @@ fn main() -> Result<()> {
         };
 
          if all_profiles_in_run_set.insert(task.profile.clone()) {
-            all_profiles_in_run_vec.push(Arc::clone(&profile));
+              all_profiles_in_run_vec.push(Arc::clone(&profile));
          }
 
         let resolved_filters = resolve_task_filters(&profile.filters, &task.filters);
@@ -1180,7 +1393,7 @@ fn main() -> Result<()> {
             Ok(files) => {
                  info!("  Found {} *.jsonl.gz files for this task.", files.len());
                  for file in files {
-                     files_to_process_with_filters.push((file, Arc::clone(&profile), resolved_filters.clone()));
+                      files_to_process_with_filters.push((file, Arc::clone(&profile), resolved_filters.clone()));
                  }
             },
             Err(e) => {
@@ -1189,7 +1402,6 @@ fn main() -> Result<()> {
             }
         }
     }
-
 
     if files_to_process_with_filters.is_empty() {
         warn!("No .jsonl.gz files found across all tasks. Exiting.");
@@ -1257,54 +1469,52 @@ fn main() -> Result<()> {
         Ok(csv_writer_manager)
     });
 
-
     info!("Starting parallel file processing...");
 
      let processing_results: Vec<Result<(), (PathBuf, anyhow::Error)>> = files_to_process_with_filters.par_iter()
          .map(|(filepath, profile, task_filters_resolved)| {
-             let record_id_map_clone = Arc::clone(&record_id_map);
-             let value_id_map_clone = Arc::clone(&value_id_map);
-             let null_ids_local_clone = Arc::clone(&null_value_ids);
-             let timestamp_clone = Arc::clone(&timestamp_str);
-             let sender_clone = batch_sender.clone();
-             let pb_clone = progress_bar.clone();
-             let process_start_time = Instant::now();
+              let record_id_map_clone = Arc::clone(&record_id_map);
+              let value_id_map_clone = Arc::clone(&value_id_map);
+              let null_ids_local_clone = Arc::clone(&null_value_ids);
+              let timestamp_clone = Arc::clone(&timestamp_str);
+              let sender_clone = batch_sender.clone();
+              let pb_clone = progress_bar.clone();
+              let process_start_time = Instant::now();
 
-             let processor = JsonlProcessor::new(
-                 Arc::clone(profile),
-                 null_ids_local_clone,
-                 record_id_map_clone,
-                 value_id_map_clone,
-                 timestamp_clone,
-                 task_filters_resolved.clone(),
-             );
+              let processor = JsonlProcessor::new(
+                   Arc::clone(profile),
+                   null_ids_local_clone,
+                   record_id_map_clone,
+                   value_id_map_clone,
+                   timestamp_clone,
+                   task_filters_resolved.clone(),
+              );
 
-             match processor.process(filepath) {
-                 Ok(output_batch) => {
-                     let duration = process_start_time.elapsed();
-                     let file_name_msg = filepath.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| filepath.display().to_string());
-                     let rows_in_batch = output_batch.count_rows();
-                     pb_clone.set_message(format!("OK: {} ({} rows, {})", file_name_msg, rows_in_batch, format_elapsed(duration)));
+              match processor.process(filepath) {
+                   Ok(output_batch) => {
+                        let duration = process_start_time.elapsed();
+                        let file_name_msg = filepath.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| filepath.display().to_string());
+                        let rows_in_batch = output_batch.count_rows();
+                        pb_clone.set_message(format!("OK: {} ({} rows, {})", file_name_msg, rows_in_batch, format_elapsed(duration)));
 
-                     if !output_batch.is_empty() {
-                         if let Err(e) = sender_clone.send(output_batch) {
-                             error!("Failed to send batch from {} to writer thread: {}. Writer likely panicked.", filepath.display(), e);
-                              return Err((filepath.to_path_buf(), anyhow::anyhow!("Writer channel closed unexpectedly")));
-                         }
-                     }
-                     pb_clone.inc(1);
-                     Ok(())
-                 },
-                 Err((path, e)) => {
-                     let file_name_msg = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
-                     error!("Error processing file {}: {}", path.display(), e);
-                     pb_clone.set_message(format!("ERR: {}", file_name_msg));
-                     pb_clone.inc(1);
-                     Err((path, e))
-                 }
-             }
+                        if !output_batch.is_empty() {
+                             if let Err(e) = sender_clone.send(output_batch) {
+                                 error!("Failed to send batch from {} to writer thread: {}. Writer likely panicked.", filepath.display(), e);
+                                  return Err((filepath.to_path_buf(), anyhow::anyhow!("Writer channel closed unexpectedly")));
+                             }
+                        }
+                        pb_clone.inc(1);
+                        Ok(())
+                   },
+                   Err((path, e)) => {
+                        let file_name_msg = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
+                        error!("Error processing file {}: {}", path.display(), e);
+                        pb_clone.set_message(format!("ERR: {}", file_name_msg));
+                        pb_clone.inc(1);
+                        Err((path, e))
+                   }
+              }
          }).collect();
-
 
     info!("File processing complete. Aggregating results...");
     progress_bar.set_message("Aggregating results...");
